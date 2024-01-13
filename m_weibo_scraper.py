@@ -7,7 +7,7 @@ import aiofiles
 import aiohttp
 import orjson
 from utils import extracted_text_from_html
-from settings import WORKER_SIZE, PROXY_RETRY, FETCHER_RETRY, GET_PROXY_FUNCTIONS, get_uid_list
+from settings import CSV_OUTPUT, WORKER_SIZE, PROXY_RETRY, FETCHER_RETRY, GET_PROXY_FUNCTIONS, get_uid_list
 
 
 
@@ -399,9 +399,6 @@ async def initiator(worker_size, uid_list, csv_file_location):
 
 
 if __name__ == '__main__':
-    page = 0
-    limit = 10
-    csv_output = "./output/weibo_test.csv"
-    uid_list = get_uid_list(page, limit)
+    uid_list = get_uid_list()
     print(uid_list)
-    asyncio.run(initiator(WORKER_SIZE, uid_list, csv_output))
+    asyncio.run(initiator(WORKER_SIZE, uid_list, CSV_OUTPUT))
