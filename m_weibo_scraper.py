@@ -2,7 +2,6 @@ import asyncio
 from datetime import datetime
 import random
 import re
-import sqlite3
 import aiocsv
 import aiofiles
 import aiohttp

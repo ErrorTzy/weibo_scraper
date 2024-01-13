@@ -1,5 +1,6 @@
 
 def get_uid_list(page, limit):
+    # import sqlite3
     # db_file = "/home/scott/Downloads/裤子/weibo.db"
     # offset =  page * limit
     # table_name = "updated_data"
