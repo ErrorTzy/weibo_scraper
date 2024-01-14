@@ -2,13 +2,13 @@ import asyncio
 from datetime import datetime
 import random
 import re
+import sqlite3
 import aiocsv
 import aiofiles
 import aiohttp
 import orjson
-from utils import extracted_text_from_html
-from settings import CSV_OUTPUT, WORKER_SIZE, PROXY_RETRY, FETCHER_RETRY, GET_PROXY_FUNCTIONS, get_uid_list
-
+from weibo_scraper_settings import *
+from weibo_scraper_utils import append_new_line_to_log, close_files, extracted_text_from_html
 
 
 _WEIBO_DATE_FORMAT = "%a %b %d %H:%M:%S %z %Y"
@@ -31,8 +31,9 @@ _MOBILE_HEADERS = {
     "Referrer-Policy": "strict-origin-when-cross-origin"
 }
 
+proxy_checker_count = None
 async def proxy_boss():
-    global _CHECKED_PROXY_QUEUE, workers_still_working
+    global _CHECKED_PROXY_QUEUE, _UNCHECKED_PROXY_QUEUE, GET_PROXY_FUNCTIONS, PROXY_LOG_NAME, WORKER_SIZE, MAXIMUM_PROXY_WORKER_COUNT, workers_still_working, proxy_checker_count
     """
     Description:
         This function is responsible for arranging everying concerning proxies, including:
@@ -46,18 +47,19 @@ async def proxy_boss():
 
     # record the data that has already been put to the unchecked queue
     previous_proxy_set = set() 
-
-    async with aiohttp.ClientSession() as proxy_boss_session:
+    
+    async with aiohttp.ClientSession(cookie_jar=aiohttp.CookieJar(), connector=aiohttp.TCPConnector(ssl=False)) as proxy_boss_session:
         while workers_still_working:
-            if not _CHECKED_PROXY_QUEUE.empty():
-                await asyncio.sleep(5)
+            if _CHECKED_PROXY_QUEUE.qsize() > 5:
+                await asyncio.sleep(10)
                 continue
-
+            
             # load proxy set
             new_proxy_set = set()
             
             for function in GET_PROXY_FUNCTIONS:
                 new_proxy_list = await function(proxy_boss_session)
+                await append_new_line_to_log(f"getting {len(new_proxy_list)} new items", PROXY_LOG_NAME)
                 new_proxy_set.update(new_proxy_list)
 
             # delete the old items in new_proxy_set and add new items to previous_proxy_set
@@ -65,26 +67,41 @@ async def proxy_boss():
             previous_proxy_set.update(new_proxy_set)
 
             # if there are no new proxies, wait 60s to retry
-            worker_count = len(new_proxy_set)
-            if worker_count == 0:
-                print("no new proxy avalible, sleeping...")
-                await asyncio.sleep(60)
+            new_workers_count = len(new_proxy_set)
+            if 0 == new_workers_count:
+                await append_new_line_to_log("No new items. Sleeping to wait for new ones", PROXY_LOG_NAME)
+                # if there are any proxy workers present, then stop panicking and rest
+                if not proxy_checker_count:
+                    await asyncio.sleep(60)
                 continue
+            
+            if proxy_checker_count == None:
+                proxy_checker_count = 0
+
+            if new_workers_count + proxy_checker_count > MAXIMUM_PROXY_WORKER_COUNT:
+                new_workers_count = MAXIMUM_PROXY_WORKER_COUNT - proxy_checker_count
+                proxy_checker_count = MAXIMUM_PROXY_WORKER_COUNT
+            else:
+                proxy_checker_count += new_workers_count
+            
+            
 
             # gather workers
-            check_proxy_workers = []
-            for _ in range(worker_count):
-                check_proxy_workers.append(asyncio.create_task(proxy_checker(proxy_boss_session)))
+            await append_new_line_to_log(f"gathering {new_workers_count} new workers, {proxy_checker_count} in all", PROXY_LOG_NAME)
+            proxy_checkers = []
+            for _ in range(new_workers_count):
+                proxy_checkers.append(asyncio.create_task(proxy_checker(proxy_boss_session)))
             
             for addr in new_proxy_set:
                 await _UNCHECKED_PROXY_QUEUE.put((addr, 0))
+            await append_new_line_to_log(f"appended {len(new_proxy_set)} new unchecked proxies", PROXY_LOG_NAME)
             
-            await asyncio.gather(*check_proxy_workers)
-    print("proxy boss done")
+            await asyncio.gather(*proxy_checkers)
+    
 
 
 async def proxy_checker(session: aiohttp.ClientSession):
-    global _CHECKED_PROXY_QUEUE, _UNCHECKED_PROXY_QUEUE, PROXY_RETRY, _CHECK_URL
+    global _CHECKED_PROXY_QUEUE, _UNCHECKED_PROXY_QUEUE, PROXY_TIMEOUT, PROXY_RETRY, _CHECK_URL, PROXY_LOG_NAME, proxy_checker_count
     """
     Description:
         This function is proxy boss' worker who 
@@ -104,22 +121,25 @@ async def proxy_checker(session: aiohttp.ClientSession):
             addr, check_count = await _UNCHECKED_PROXY_QUEUE.get()
             if check_count < PROXY_RETRY:
                 break
-        
+        await append_new_line_to_log(f"proxy checker get {addr}(retried {check_count} times)", PROXY_LOG_NAME)
         if check_count > PROXY_RETRY - 1 and _UNCHECKED_PROXY_QUEUE.empty():
             break
 
         # try to check if the proxy is reachable by connecting to _CHECK_URL
         try:
-            async with session.get(_CHECK_URL, proxy=addr) as resp:
+            async with session.get(_CHECK_URL, proxy=addr, timeout=PROXY_TIMEOUT) as resp:
                 status_code = resp.status
-                print(f"{status_code}...{addr}")
+                await append_new_line_to_log(f"{status_code}...{addr}, current avalible: {_CHECKED_PROXY_QUEUE.qsize()}", PROXY_LOG_NAME)
                 await _CHECKED_PROXY_QUEUE.put(addr)
 
         # put back to the queue
-        except aiohttp.ClientError as e:
-            print(f"{addr} proxy check failed: {e}, remaining {PROXY_RETRY - check_count}")
+        except (aiohttp.ClientError, TimeoutError) as e:
+            await append_new_line_to_log(f"{addr} proxy check failed: {e}, retry remaining {PROXY_RETRY - check_count}, current avalible proxy: {_CHECKED_PROXY_QUEUE.qsize()}", PROXY_LOG_NAME)
             check_count += 1
             await _UNCHECKED_PROXY_QUEUE.put((addr, check_count))
+    
+    proxy_checker_count -= 1
+    await append_new_line_to_log(f"proxy checker get off work. remaining {proxy_checker_count}", PROXY_LOG_NAME)
         
 
             
@@ -143,24 +163,24 @@ async def proxy_fetcher(session: aiohttp.ClientSession, url, retry=FETCHER_RETRY
     """
 
     # if retry has excceded limit, return
-    if retry < 0:
+    if retry < 1:
         return None, proxy
-    
-    # If a proxy is not given or None/False, get a proxy from checked queue. 
-    if proxy:
-        proxy_addr = proxy
-    else:
-        proxy_addr = await _CHECKED_PROXY_QUEUE.get()
     try:
+    # If a proxy is not given or None/False, get a proxy from checked queue. 
+        if proxy:
+            proxy_addr = proxy
+        else:
+            proxy_addr = await _CHECKED_PROXY_QUEUE.get()
+        
         async with session.get(url, proxy=proxy_addr, **kwargs) as resp:
             response_text = await resp.text(encoding='utf8')
             return response_text, proxy_addr
-    
+        
     # if the connection throws an error, put it back to the unchecked queue
-    except aiohttp.ClientError as e:
-        print(f"{url} connection failed to connect {url}:{e}")
+    except (aiohttp.ClientError, TimeoutError) as e:
+        await append_new_line_to_log(f"{proxy_addr} connection failed to connect {url} (trying to switch proxy in {_CHECKED_PROXY_QUEUE.qsize()} avalible, retry remaining {retry}):{e}", PROXY_LOG_NAME)
         retry -= 1
-        await _UNCHECKED_PROXY_QUEUE.put((proxy_addr, 1))
+        await _UNCHECKED_PROXY_QUEUE.put((proxy_addr, 999))
         return await proxy_fetcher(session, url, retry=retry, proxy=None, **kwargs)
 
 
@@ -210,8 +230,8 @@ async def mweibo_worker(id_queue: asyncio.Queue, results_queue: asyncio.Queue):
                 user_weibo_msgs_list, private_proxy = await fetch_weibo_messages(private_proxy, user_id, weibo_fid, session)
                 if user_weibo_msgs_list and len(user_weibo_msgs_list) > 0:
                     await results_queue.put(user_weibo_msgs_list)
-            except (TypeError, KeyError):
-                print(f"page data invalid {m_weibo_index_json_text}")
+            except (TypeError, KeyError, orjson.JSONDecodeError):
+                await append_new_line_to_log(f"page data invalid {m_weibo_index_json_text}", ERROR_LOG_NAME)
             finally:
                 await asyncio.sleep(random.random())
 
@@ -228,16 +248,16 @@ async def fetch_weibo_messages(private_proxy, user_id, fid, session):
     has_next = True
     since_id = None
     all_lines = []
-    sleep_determinator = 0
+    # sleep_determinator = 0
     while has_next:
         # sleep around 1s per page, and additional 1s more for every 5 page
-        await asyncio.sleep(0.5 + random.random())
-        sleep_determinator += 1
-        if sleep_determinator > 4:
-            await asyncio.sleep(0.5 + random.random())
-            sleep_determinator = 0
+        await asyncio.sleep(random.random())
+        # sleep_determinator += 1
+        # if sleep_determinator > 4:
+        #     await asyncio.sleep(0.5 + random.random())
+        #     sleep_determinator = 0
                     
-                    # the first page does not have since_id
+        # the first page does not have since_id
         user_info_url = f"https://m.weibo.cn/api/container/getIndex?type=uid&value={user_id}&containerid={fid}"
         if since_id:
             user_info_url = user_info_url + f"&since_id={since_id}"
@@ -252,8 +272,8 @@ async def fetch_weibo_messages(private_proxy, user_id, fid, session):
                     data_line = get_row_from_mobile_data(card["mblog"])
                 print(f"{data_line[0]}...ok")
                 all_lines.append(data_line)
-        except KeyError:
-            print(weibo_messege_json_text)
+        except (KeyError, AttributeError, orjson.JSONDecodeError):
+            await append_new_line_to_log(weibo_messege_json_text, ERROR_LOG_NAME)
             has_next = False
     return all_lines, private_proxy
 
@@ -269,7 +289,7 @@ async def check_if_has_detail(private_proxy, session, card):
                                                                      proxy=private_proxy, 
                                                                      headers=_MOBILE_HEADERS)
         match = _DETAIL_PAGE_PATTERN.search(weibo_messege_page_text)
-        if match:
+        if match and len(match) > 0:
             weibo_messege_page_json = orjson.loads(match.group(1))
             return get_row_from_mobile_data(weibo_messege_page_json["status"]), private_proxy
     return None, private_proxy
@@ -365,10 +385,11 @@ async def writer(results_queue: asyncio.Queue, csv_file):
         while not (workers_still_working == 0 and results_queue.empty()):
             result = await results_queue.get()
             if result:
-                print(result)
                 await writer.writerows(result)
             results_queue.task_done()
+    
     print("writer jobs done")
+    await close_files()
 
 
 uid_assigner_work_done = False
@@ -397,8 +418,18 @@ async def initiator(worker_size, uid_list, csv_file_location):
                         *mobile_weibo_workers)
 
 
+def get_uid_list(range_from, range_to, limit):
+    db_file = "/media/scott/ScottTang/backup/weibo.db"
+    table_name = "weibo_phone"
+    sql_fetch_all_uid = f"SELECT uid FROM {table_name} WHERE uid BETWEEN {range_from} AND {range_to} LIMIT {limit}"
+    conn = sqlite3.connect(db_file)
+    cursor = conn.cursor()
+    cursor.execute(sql_fetch_all_uid)
+    return [row[0] for row in cursor.fetchall()]
+
 
 if __name__ == '__main__':
-    uid_list = get_uid_list()
-    print(uid_list)
-    asyncio.run(initiator(WORKER_SIZE, uid_list, CSV_OUTPUT))
+
+    csv_output = f"{CSV_OUTPUT_FOLDER}weibo_final_{RANGE_FROM}.csv"
+    uid_list = get_uid_list(RANGE_FROM, RANGE_TO, LIMIT)
+    asyncio.run(initiator(WORKER_SIZE, uid_list, csv_output))
