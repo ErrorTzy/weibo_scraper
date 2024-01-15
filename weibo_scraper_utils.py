@@ -16,6 +16,24 @@ async def write_string_to_file(string, filename):
     await write_files[filename].write(string)
     await write_files[filename].flush()
 
+append_files = {}
+
+async def append_string_to_file(string, filename):
+    global write_files
+    try:
+        aiofiles
+    except NameError:
+        import aiofiles
+    
+    if filename not in write_files:
+        write_files[filename] = await aiofiles.open(LOG_OUTPUT_FOLDER + filename, 'a+')
+        
+    if type(string) is not str:
+        string = str(string)
+        
+    await write_files[filename].write(string)
+    await write_files[filename].flush()
+
 
 log_files = {}
 
@@ -41,9 +59,12 @@ async def close_files():
     global write_files, log_files
 
     for fileobj in log_files:
-        await fileobj.close()
+        await log_files[fileobj].close()
     for fileobj in write_files:
-        await fileobj.close()
+        await write_files[fileobj].close()
+    for fileobj in append_files:
+        await append_files[fileobj].close()
+
 
 def load_json_from_file(filename):
     try:
@@ -74,6 +95,7 @@ async def print_writer(results_queue):
         print("......print_writer......")
         print(result)
         print("......print_writer......")
+
 
 
 def empty_queue(q):
